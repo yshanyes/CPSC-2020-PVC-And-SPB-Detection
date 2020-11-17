@@ -1,7 +1,9 @@
 # ICBEB/CPSC Challenge 2020
 
-Premature Beat Detection from Long-term ECGs Using Modified U-Net
+Premature Beat Detection from Long-term ECGs Using Modified U-Net  
+
 Shan Yang, Heng Xiang, Chunli Wang, Qingda Kong
+
 Chengdu Spaceon Electronics Co., LTD.
 
 ## Abstract
