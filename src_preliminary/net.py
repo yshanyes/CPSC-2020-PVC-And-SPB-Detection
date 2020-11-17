@@ -1,0 +1,315 @@
+from keras.layers import LSTM, GRU, TimeDistributed, Bidirectional, LeakyReLU
+from keras.layers import Dense, Dropout, Activation, Flatten,  Input, Reshape, GRU, CuDNNGRU,CuDNNLSTM
+from keras.layers import Convolution1D, MaxPool1D, GlobalAveragePooling1D,concatenate,AveragePooling1D,GlobalMaxPooling1D
+from keras.models import Model
+from keras import initializers, regularizers, constraints
+from keras.layers import Layer
+import numpy as np
+from keras.layers.normalization import BatchNormalization
+from keras import regularizers
+from keras.layers import Reshape
+
+from keras.layers import Input,Dropout,BatchNormalization,Activation,Add,core,Multiply
+from keras.layers.convolutional import Conv1D, MaxPooling1D, UpSampling1D, AveragePooling1D
+from keras.layers import GlobalMaxPooling1D, GlobalAveragePooling1D
+from keras.layers.core import Dense, Lambda
+from keras.layers.core import Activation
+from keras.layers import Input
+from keras.layers.merge import add
+from keras.layers.normalization import BatchNormalization
+from keras.regularizers import l2
+import keras.backend as K
+from keras.layers import LeakyReLU
+
+
+def dot_product(x, kernel):
+    if K.backend() == 'tensorflow':
+        return K.squeeze(K.dot(x, K.expand_dims(kernel)), axis=-1)
+    else:
+        return K.dot(x, kernel)
+
+class AttentionWithContext(Layer):
+    def __init__(self,
+                 W_regularizer=None, u_regularizer=None, b_regularizer=None,
+                 W_constraint=None, u_constraint=None, b_constraint=None,
+                 bias=True, **kwargs):
+        self.supports_masking = True
+        self.init = initializers.get('glorot_uniform')
+        self.W_regularizer = regularizers.get(W_regularizer)
+        self.u_regularizer = regularizers.get(u_regularizer)
+        self.b_regularizer = regularizers.get(b_regularizer)
+        self.W_constraint = constraints.get(W_constraint)
+        self.u_constraint = constraints.get(u_constraint)
+        self.b_constraint = constraints.get(b_constraint)
+        self.bias = bias
+        super(AttentionWithContext, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        assert len(input_shape) == 3
+        self.W = self.add_weight((input_shape[-1], input_shape[-1],),
+                                 initializer=self.init,
+                                 name='{}_W'.format(self.name),
+                                 regularizer=self.W_regularizer,
+                                 constraint=self.W_constraint)
+        if self.bias:
+            self.b = self.add_weight((input_shape[-1],),
+                                     initializer='zero',
+                                     name='{}_b'.format(self.name),
+                                     regularizer=self.b_regularizer,
+                                     constraint=self.b_constraint)
+            self.u = self.add_weight((input_shape[-1],),
+                                 initializer=self.init,
+                                 name='{}_u'.format(self.name),
+                                 regularizer=self.u_regularizer,
+                                 constraint=self.u_constraint)
+        super(AttentionWithContext, self).build(input_shape)
+
+    def compute_mask(self, input, input_mask=None):
+        return None
+
+    def call(self, x, mask=None):
+        uit = dot_product(x, self.W)
+        if self.bias:
+            uit += self.b
+        uit = K.tanh(uit)
+        ait = dot_product(uit, self.u)
+        a = K.exp(ait)
+        if mask is not None:
+            a *= K.cast(mask, K.floatx())
+        a /= K.cast(K.sum(a, axis=1, keepdims=True) + K.epsilon(), K.floatx())
+        a = K.expand_dims(a)
+        weighted_input = x * a
+        return K.sum(weighted_input, axis=1)
+
+    def compute_output_shape(self, input_shape):
+        return input_shape[0], input_shape[-1]
+
+
+#two parameters: input and reduction ratio
+def squeeze_excite_block(block_input, ratio=8):
+    filter_kernels = block_input._keras_shape[-1]
+    z_shape = (1, filter_kernels)
+    #z = GlobalAveragePooling1D()(block_input)
+    z = GlobalMaxPooling1D()(block_input)
+    #z = AttentionWithContext()(block_input)
+    z = Reshape(z_shape)(z)
+    s = Dense(filter_kernels//ratio, activation='relu', use_bias=False)(z)
+    s = Dense(filter_kernels, activation='sigmoid', use_bias=False)(s)
+    x = Multiply()([block_input, s])#multiply
+    return x
+
+def conv1d_bn(x, filters, filter_size, padding='same', dilation=1, strides=1, activation='relu', name=None):
+
+    x = Conv1D(filters, filter_size, dilation_rate=dilation, strides=strides, padding=padding, use_bias=False)(x)
+    x = BatchNormalization()(x)
+    if(activation == None):
+        return x
+    x = Activation(activation, name=name)(x)
+    return x
+
+def MultiResBlock(U, inp, alpha = 1):
+    '''
+    MultiRes Block
+    Arguments:
+        U {int} -- Number of filters in a corrsponding UNet stage
+        inp {keras layer} -- input layer 
+    Returns:
+        [keras layer] -- [output layer]
+    '''
+    W = alpha * U
+    shortcut = inp
+
+    shortcut = conv1d_bn(shortcut, int(W*0.167) + int(W*0.333) + int(W*0.5), 1, dilation=1, activation=None, padding='same')
+
+    #print(int(W*0.167) + int(W*0.333) + int(W*0.5))
+
+    conv3x3 = conv1d_bn(inp, int(W*0.167), 3,  dilation=2, activation='relu', padding='same')
+
+    conv5x5 = conv1d_bn(conv3x3, int(W*0.333), 3, dilation=2, activation='relu', padding='same')
+
+    conv7x7 = conv1d_bn(conv5x5, int(W*0.5), 3, dilation=2, activation='relu', padding='same')
+
+    out = concatenate([conv3x3, conv5x5, conv7x7])
+    out = BatchNormalization()(out)
+
+    out = add([shortcut, out])
+    out = Activation('relu')(out)
+    out = BatchNormalization()(out)
+
+    return out
+
+def ResPath(inp, filters, length):
+    '''
+    ResPath
+    Arguments:
+        filters {int} -- [description]
+        length {int} -- length of ResPath
+        inp {keras layer} -- input layer 
+    
+    Returns:
+        [keras layer] -- [output layer]
+    '''
+    shortcut = inp
+    shortcut = conv1d_bn(shortcut, filters, 1, dilation=1, activation=None, padding='same')
+    out = conv1d_bn(inp, filters, 3, dilation=2, activation='relu', padding='same')
+    out = add([shortcut, out])
+    out = Activation('relu')(out)
+    out = BatchNormalization()(out)
+
+    for i in range(length-1):
+        shortcut = out
+        shortcut = conv1d_bn(shortcut, filters, 1, dilation=1, activation=None, padding='same')
+        out = conv1d_bn(out, filters, 3, dilation=2, activation='relu', padding='same')
+        out = add([shortcut, out])
+        out = Activation('relu')(out)
+        out = BatchNormalization()(out)
+    return out
+
+def resnet_bottleneck(block_input,num_neurons,kernel_size):
+    
+    x = Conv1D(num_neurons, 1, padding='same', kernel_initializer='he_normal',use_bias=False)(block_input)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    
+    x = Conv1D(num_neurons, kernel_size, padding='same', dilation_rate=2, kernel_initializer='he_normal',use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+        
+    x = Conv1D(num_neurons, 1, padding='same', kernel_initializer='he_normal',use_bias=False)(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    #x = squeeze_excite_block(x)
+    out = add([x, block_input])
+    
+
+    return out
+
+def se_bottleneck(block_input,num_neurons,kernel_size=[3,5,7]):
+    #x = Conv1D(filters=num_neurons, kernel_size=kernel_size, dilation_rate=2, activation=None, padding="same")(block_input)
+    #x = BatchNormalization()(x)
+    #x = LeakyReLU(alpha=0.3)(x)
+
+    # conv = [] #[3,5,7,11,15]
+    # conv.append(resnet_bottleneck(block_input,num_neurons,kernel_size[0]))
+    # conv.append(resnet_bottleneck(block_input,num_neurons,kernel_size[1]))
+    # conv.append(resnet_bottleneck(block_input,num_neurons,kernel_size[2]))
+    # x = concatenate(conv)
+    
+    x = MultiResBlock(U=num_neurons, inp=block_input)
+
+    x = Bidirectional(CuDNNLSTM(x._keras_shape[-1]//2+1, input_shape=x._keras_shape,return_sequences=True,return_state=False))(x)
+    # x = Bidirectional(CuDNNGRU(x._keras_shape[-1]//2, input_shape=x._keras_shape,return_sequences=True,return_state=False))(x)
+    x = squeeze_excite_block(x)
+    return x
+
+# Build model
+def build_model(start_neurons=16, dropout_ratio = None, filter_size=1, nClasses=3, resPath=True):
+    # 101 -> 50
+    input_layer = Input(shape=(2000,1), dtype='float32', name='main_input')
+       
+    # conv1 = Conv1D(start_neurons * 1, filter_size, activation=None, padding="same")(input_layer)
+    #conv1 = resnet_bottleneck(bottleneck,start_neurons * 1,3)
+
+    conv1 = input_layer
+    conv1 = se_bottleneck(conv1,start_neurons * 1)
+    pool1 = MaxPooling1D((2))(conv1)
+    if resPath:
+        conv1 = ResPath(conv1,start_neurons * 1, 4)
+    
+    if dropout_ratio:
+        pool1 = Dropout(dropout_ratio)(pool1)
+
+    # 50 -> 25
+    # conv2 = Conv1D(start_neurons * 2, filter_size, activation=None, padding="same")(pool1)
+    conv2 = pool1
+    conv2 = se_bottleneck(conv2,start_neurons * 2)
+    pool2 = MaxPooling1D((2))(conv2)
+    if resPath:
+        conv2 = ResPath(conv2,start_neurons * 1, 3)
+    
+    if dropout_ratio:
+        pool2 = Dropout(dropout_ratio)(pool2)
+
+    # 25 -> 12
+    # conv3 = Conv1D(start_neurons * 4, filter_size, activation=None, padding="same")(pool2)
+    conv3 = pool2
+    conv3 = se_bottleneck(conv3,start_neurons * 4)
+    pool3 = MaxPooling1D((2))(conv3)
+    if resPath:
+        conv3 = ResPath(conv3,start_neurons * 1, 2)
+
+    if dropout_ratio:
+        pool3 = Dropout(dropout_ratio)(pool3)
+
+    # 12 -> 6
+    # conv4 = Conv1D(start_neurons * 8, filter_size, activation=None, padding="same")(pool3)
+    conv4 = pool3
+    conv4 = se_bottleneck(pool3,start_neurons * 8)
+    pool4 = MaxPooling1D((2))(conv4)
+    if resPath:
+        conv4 = ResPath(conv4,start_neurons * 1, 1)
+
+    if dropout_ratio:
+        pool4 = Dropout(dropout_ratio)(pool4)
+
+    # Middle
+    # convm = Conv1D(start_neurons * 16, filter_size, activation=None, padding="same")(pool4)
+    convm = pool4
+    convm = se_bottleneck(convm,start_neurons * 16)
+    
+    # 6 -> 12
+    # deconv4 = Conv1D(start_neurons * 8, filter_size,activation='relu', padding='same'
+    #                  )(UpSampling1D(size=2)(convm))#kernel_initializer='he_normal'
+    deconv4 = UpSampling1D(size=2)(convm)
+    uconv4 = concatenate([deconv4, conv4])
+    
+    if dropout_ratio:
+        uconv4 = Dropout(dropout_ratio)(uconv4)
+    #uconv4 = Conv1D(start_neurons * 8, filter_size, activation=None, padding="same")(uconv4)
+    uconv4 = se_bottleneck(uconv4,start_neurons * 8)
+        
+    # 12 -> 25
+    # deconv3 = Conv1D(start_neurons * 4, filter_size, activation='relu', padding='same',
+    #                  )(UpSampling1D(size=2)(uconv4))#kernel_initializer='he_normal'
+    deconv3 = UpSampling1D(size=2)(uconv4)      
+    uconv3 = concatenate([deconv3, conv3]) 
+    
+    if dropout_ratio:
+        uconv3 = Dropout(dropout_ratio)(uconv3)
+    #uconv3 = Conv1D(start_neurons * 4, filter_size, activation=None, padding="same")(uconv3)
+    uconv3 = se_bottleneck(uconv3,start_neurons * 4)
+
+    # 25 -> 50
+    # deconv2 = Conv1D(start_neurons * 2, filter_size, activation='relu', padding='same',
+    #                  )(UpSampling1D(size=2)(uconv3))#kernel_initializer='he_normal'
+    deconv2 = UpSampling1D(size=2)(uconv3)
+    uconv2 = concatenate([deconv2, conv2])
+        
+    if dropout_ratio:
+        uconv2 = Dropout(dropout_ratio)(uconv2)
+    #uconv2 = Conv1D(start_neurons * 2, filter_size, activation=None, padding="same")(uconv2)
+    uconv2 = se_bottleneck(uconv2,start_neurons * 2)
+   
+    # 50 -> 101
+    # deconv1 = Conv1D(start_neurons * 1, filter_size, activation='relu', padding='same',
+    #                  )(UpSampling1D(size=2)(uconv2))#kernel_initializer='he_normal'
+    deconv1 = UpSampling1D(size=2)(uconv2)
+    uconv1 = concatenate([deconv1, conv1])
+    
+    if dropout_ratio:
+        uconv1 = Dropout(dropout_ratio)(uconv1)        
+    # uconv1 = Conv1D(start_neurons * 1, filter_size, activation=None, padding="same")(uconv1)
+    uconv1 = se_bottleneck(uconv1,start_neurons * 1)
+    
+    if dropout_ratio:
+        uconv1 = Dropout(dropout_ratio)(uconv1)
+
+    output_layer = Conv1D(nClasses, 1, activation='softmax', padding='same')(uconv1)#kernel_initializer='he_normal'
+    model = Model(inputs=input_layer, outputs=output_layer)
+    
+    return model
+
+
+if __name__ == '__main__':
+    model = build_model(start_neurons=32, dropout_ratio=0, filter_size=1, nClasses=3)
+    model.summary()
